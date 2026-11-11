@@ -51,13 +51,13 @@ pub trait FileTypeDisplay {
 impl FileTypeDisplay for FileType {
     fn display(&self) -> String {
         (if self.is_dir() {
-            "directory"
+            "Directory"
         } else if self.is_file() {
-            "file"
+            "File"
         } else if self.is_symlink() {
-            "symlink"
+            "Symlink"
         } else {
-            "unknown"
+            "Unknown"
         })
         .into()
     }

@@ -1,0 +1,163 @@
+# RNG スループット最適化案 (2026-06-12)
+
+目標: `cargo run --release --example test` (N=100M, 400MB/800MB バッファ書き込み) で
+**32bit: 7 GS/s 以上(可能なら 10 GS/s 超)、64bit: 3.5 GS/s 以上**。
+
+---
+
+## 1. 現状の実測 (AMD Ryzen 7 9800X3D, DDR5-5600 2ch)
+
+| 区分 | 上位グループ | GS/s | GB/s 換算 |
+|---|---|---|---|
+| 32bit | xoshiro128ppx16 / philox32 / sfc32x8 / splitmix32x16 / jsf32x16 / pcg32x8 / squares32x8 | 6.65–6.81 | **26.6–27.2** |
+| 64bit | biski64x8 / xoshiro256ssx2 / cet64x8 / sfc64x8 | 3.37–3.41 | **27.0–27.3** |
+
+**核心的観測**: アルゴリズムが全く異なる十数種が 32bit/64bit とも *同じ* 27.2 GB/s に収束している。
+これは計算律速ではなく **DRAM 書き込み帯域律速** の決定的なサイン。
+
+### ボトルネックの正体: Zen 単一 CCD の書き込み帯域
+
+- 9800X3D は単一 CCD。CCD→IOD の Infinity Fabric (GMI) は **書き込みが読み出しの半分**
+  (約 16B/cycle × FCLK ≒ 理論 32 GB/s、実効 27–30 GB/s)。
+- DDR5-5600 2ch の理論帯域 89.6 GB/s は読み出し側の話で、書き込みはこの GMI 制約が先に当たる。
+- **i5-12450H で 13 GS/s (52 GB/s) が出た理由**: Intel はモノリシックダイで
+  コア→メモリコントローラ間に GMI のような書き込み半減リンクがなく、
+  NT ストアで DRAM 書き込み帯域をほぼフルに使える。CPU が速いからではない。
+
+### 目標の物理的実現性 (このマシンで)
+
+| 目標 | 必要帯域 | 判定 |
+|---|---|---|
+| 32bit 7.0 GS/s | 28.0 GB/s | ⚠️ GMI 実効上限 (~28–30 GB/s) スレスレ。NT ストア徹底+チューニングで到達可能性あり |
+| 64bit 3.5 GS/s | 28.0 GB/s | ⚠️ 同上 |
+| 32bit 10+ GS/s | 40+ GB/s | ❌ **DRAM 直書きでは物理的に不可能**。§4 の L3 常駐戦略が必須 |
+
+---
+
+## 2. 施策A: DRAM 書き込み効率の改善(7 / 3.5 GS/s 到達用)
+
+### A-1. NT(非テンポラル)ストアの徹底 【最優先・効果大】
+
+通常ストアは RFO (Read-For-Ownership) でキャッシュラインを先に読むため、
+実効トラフィックが書き込み量の約2倍になる。NT ストアは書き込みのみ。
+
+現状監査(`_mm*_stream` 使用数 / `par_chunks_mut` 使用数):
+
+| 状態 | ファイル |
+|---|---|
+| ✅ NT あり | cabi32: jsf, philox, sfc, xoroshiro, xoshiro, squares / cabi64: biski, cet, sfc, xoshiro |
+| ❌ **並列だが NT なし** | **cabi32/threefry** (par:8, stream:0), **cabi64/philox** (par:4, stream:0), **cabi64/xoroshiro** (par:8, stream:0), cabi64/splitmix (par:4, stream:0) |
+| ❌ 並列化すらなし | cabi32: lcg, mersenne(mt19937/sfmt), xorshift / cabi64: lcg, mersenne, threefish, twisted_gfsr, xorshift |
+| ⚠️ 部分的 | cabi32/pcg (stream:2), cabi32/splitmix (stream:1) |
+
+実装方針:
+- `_internal.rs` に「先頭を 64B 境界までスカラー/storeu で埋める → 本体は `_mm256_stream_si256`/`_mm512_stream_si512` → 末尾 storeu → チャンク末で `_mm_sfence`」の共通ヘルパーを追加(既存 `fill_chunk` の NT 版)。
+- 現状の「aligned なら stream / unaligned なら全部 storeu」という二分岐は、
+  rayon のチャンク境界が 64B に揃わないと **チャンク全体が storeu に落ちる**。
+  → 先頭アラインメント処理に変更して常に NT 経路へ。
+- `PAR_CHUNK` を要素数でなくバイトで 64B の倍数に固定(u32: 0x20000 は 512KB で OK だが、境界がバッファ先頭アラインに依存しない設計に)。
+
+対象の筆頭は 64bit 側: **philox64 (2.77) / xoroshiro256 系 / splitmix64 (2.87)** に
+AVX-512 + NT ストアのチャンクパスを追加(biski64x8 と同型でよい)。
+
+### A-2. rayon スレッド数の固定・削減 【効果中・実装小】
+
+メモリバウンドでは 8C/16T の 16 スレッドは過剰で、SMT 兄弟スレッド同士が
+ストアバッファ/L2 を奪い合う。書き込み帯域は 4–8 スレッドで飽和する。
+
+- ベンチ側: `RAYON_NUM_THREADS=4..16` を振って最適値を確認(予想: 6–8)。
+- ライブラリ側: bulk fill 専用に `ThreadPoolBuilder::new().num_threads(physical_cores)` の
+  専用プール(`OnceLock`)を持つ。
+
+### A-3. チャンクサイズ/分割方法 【効果小〜中】
+
+- `par_chunks_mut(PAR_CHUNK)` の固定 512KB は 100M 要素で 800 チャンク → work-stealing 往復と
+  per-chunk RNG 初期化 (`chunk_seed32` + コンストラクタ) が 800 回。
+  → `count / num_threads` の静的分割(チャンク数 = スレッド数)に変更し、
+  初期化と steal のオーバーヘッドを排除。counter-based RNG (philox/threefry/squares) は
+  シード再生成でなく **カウンタオフセットでの分割**(統計的にも正しい)。
+- 期待効果は数%だが、28 GB/s 目標はその数%の勝負。
+
+### A-4. ベンチ側: Large Pages + ベースライン計測 【計測精度】
+
+- 400MB を 4KB ページで書くと TLB ミスが帯域を数% 削る。
+  `VirtualAlloc(MEM_LARGE_PAGES)` (2MB ページ、要 SeLockMemoryPrivilege) で確保した
+  バッファ版を追加。
+- **NT ストア並列 memset ベースライン**を test.rs に追加し「このマシンの書き込み天井」を
+  毎回表示する。各 RNG は天井に対する % で評価する(GS/s 絶対値はマシン依存のため)。
+
+### A-5. 期待値
+
+A-1〜A-4 をすべて適用した場合の予想: 32bit 上位 6.8 → **7.0–7.5 GS/s**、
+64bit 上位 3.4 → **3.5–3.7 GS/s**。GMI 実効上限に到達した時点で頭打ち。
+
+---
+
+## 3. 施策B: 下位アルゴリズムの底上げ(帯域到達前のもの)
+
+帯域未到達 = 計算/並列化不足。伸びしろが大きい順:
+
+| 対象 | 現状 | 原因(推定) | 施策 |
+|---|---|---|---|
+| threefish256 | 0.08 | 単一スレッド・ブロック暗号を逐次 | counter-mode 並列化 + rayon。それでも重い暗号なので優先度低 |
+| pcg32 (スカラー) | 0.90 | 単一スレッド | LCG は O(log n) ジャンプアヘッドで厳密分割可能 → rayon 並列化 |
+| sfc32 / splitmix32 / xoshiro128pp | 1.1–1.3 | 単一スレッド | splitmix はカウンタ分割、xoshiro は jump() で厳密分割 |
+| mt19937 / sfmt 系 | 1.7–3.2 | ブロック生成→memcpy の二重コピー + 非並列 | 出力バッファ直接生成 + NT ストア。SFMT は本来 SIMD なのに 2 GS/s 止まりは内部 state 再生成のたび一時配列経由している可能性 → 直書き化 |
+| philox32x4 | 2.46 | x4(SSE 幅)+ 非 stream | 役割は philox32x4x4 (AVX-512) と重複。非推奨化 or x4x4 と同じチャンク構造へ |
+| cet256x2 | 2.49 | cet64x8 (3.38) より遅い回帰 | チャンクパスの NT/アンロール監査 |
+| threefry32x4 | 5.37 | stream:0 | NT ストア化のみで +20% 見込み |
+
+また **xoroshiro64ss / xoroshiro64ssx8 / xoroshiro64ssx16 が test.rs に未掲載**。
+ユーザー目標に xoroshiro が含まれるため、ベンチへ追加すること。
+
+---
+
+## 4. 施策C: 10 GS/s 超を狙う戦略(発想の転換が必要)
+
+DRAM 直書きでは 27–30 GB/s が物理上限のため、**40 GB/s 必要な 10 GS/s は出力先を変えるしかない**。
+
+### C-1. L3 常駐ワーキングセット 【9800X3D の切り札】
+
+9800X3D は **L3 96MB (X3D)**。バッファを L3 に収まるサイズ
+(u32 × 8M〜16M = 32–64MB)にすると、書き込みは L3 で完結し
+GMI/DRAM を一切通らない。L3 書き込み帯域は数百 GB/s。
+
+- ベンチに「L3 常駐モード」(N=8M を 12 回転 = 同じ総生成数)を追加。
+  SIMD 系 (xoshiro128ppx16, philox32x4x4 等) は **10–20+ GS/s** が見込める。
+- ※ このモードでは NT ストアは逆効果(キャッシュをバイパスしてしまう)。
+  `count` がしきい値(例: 32MB)以下なら通常ストア、超えたら NT、という
+  サイズ適応ディスパッチを `fill_chunk` 系ヘルパーに入れる。
+  i5-12450H (L3 12MB) など他マシンでも同じ分岐が正しく働く。
+
+### C-2. 生成と消費の融合 API
+
+実用途では「400MB の乱数を書いてから読む」のは帯域の二度払い。
+`next_f32s` の代わりに、コールバック/イテレータでレジスタ上の乱数を直接消費する API
+(例: モンテカルロの reduce)なら生成スループットは純粋に計算律速になる。
+C ABI には向かないが Rust API (`Rng32V512::nextuv` 直接利用) として文書化する価値あり。
+
+### C-3. ベンチの公平性メモ
+
+- i5-12450H の 13 GS/s は DRAM 書き込み帯域の差(モノリシック vs チップレット)であり、
+  コード品質の差ではない。マシン間比較は §A-4 の memset 天井比(%)で行うこと。
+- 本ベンチの `measure` は best-of-3 のため、1 回でも他プロセス影響のない回があれば拾える。OK。
+
+---
+
+## 5. 実施順序(推奨)
+
+1. **[計測]** A-4: memset 天井ベースライン + GB/s 併記 + xoroshiro 追加 → 以降の施策を %で評価可能に
+2. **[本命]** A-1: NT ストア徹底(特に cabi64/philox, cabi64/xoroshiro, cabi32/threefry)
+3. A-2/A-3: スレッド数・静的分割チューニング → ここまでで 7 / 3.5 GS/s 判定
+4. **[10GS/s]** C-1: サイズ適応ストア + L3 常駐ベンチモード
+5. B: 下位アルゴリズム底上げ(pcg32/sfmt/threefish の並列化)
+6. C-2: 融合 API の設計検討
+
+## 6. リスク・注意
+
+- NT ストアは store buffer を 64B 単位で埋めないと書き込み結合 (WC) が崩れて逆に遅くなる。
+  必ず 1 キャッシュライン分を連続して stream すること(x8 なら 2 本、x16 なら 1 本で 64B)。
+- `_mm_sfence` はチャンク末尾に 1 回。ループ内に入れない。
+- counter-based 分割(philox 等)以外の per-chunk シード再生成は出力列が変わる
+  (現仕様も既にそうなので互換性問題はないが、テストのハードコード期待値は禁止のまま維持)。
+- csbindgen 制約: extern "C" シグネチャはリテラル維持。ボディ/ヘルパーのみ変更可。

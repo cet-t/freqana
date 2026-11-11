@@ -1,0 +1,32 @@
+# Task: rng32/rng64 → prng/{b32,b64} + cbrng/{b32,b64}
+
+## 決定事項
+- `src/prng/b32/`, `src/prng/b64/` に非カウンタ系
+- `src/cbrng/b32/` = philox, threefry, squares
+- `src/cbrng/b64/` = philox, threefish
+- 破壊的変更 OK（旧 `rng32`/`rng64` モジュールパスは廃止、ルート re-export は維持）
+
+## Steps
+- [x] git mv でファイル移動
+- [x] prng/mod.rs, prng/b32/mod.rs, prng/b64/mod.rs 作成
+- [x] cbrng/mod.rs, cbrng/b32/mod.rs, cbrng/b64/mod.rs 作成
+- [x] lib.rs 更新
+- [x] `crate::rng32::` / `crate::rng64::` 参照を全置換
+- [x] build.rs の csbindgen input_extern_file パス更新
+- [x] README.md / doc テストのパス更新
+- [x] 検証
+
+## Review
+
+- `src/prng/{b32,b64}`（状態付き）と `src/cbrng/{b32,b64}`（カウンタベース: philox/threefry/squares,
+  philox/threefish）に再配置。git mv で履歴保持。
+- `impl_default_from_seed*` 呼び出しを prng/cbrng の各 mod.rs に分割。
+  cabi 用 `pub(crate)` 定数の再エクスポートも所属モジュールへ移動。
+- lib.rs はルート glob 再エクスポートを維持（`urng::Jsf32` 等は不変）。
+  旧 `urng::rng32` / `urng::rng64` モジュールパスは廃止（破壊的変更）。
+- build.rs の csbindgen `input_extern_file` は csbindgen がテキスト解析するため実パスを追随更新。
+- 検証: `cargo build` / `--all-features` / `--examples` 成功、clippy 警告なし、
+  `cargo test --all-features` lib 94 passed / doc 105 passed、失敗ゼロ。
+
+---
+（以前のタスク記録は git 履歴を参照）

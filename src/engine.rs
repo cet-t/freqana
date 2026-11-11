@@ -1,6 +1,9 @@
-use std::path::PathBuf;
+use std::result::Result as StdResult;
+use std::{fs::read_dir, path::PathBuf, sync::Mutex};
 
 use aho_corasick::AhoCorasick;
+use anyhow::anyhow;
+use rayon::prelude::*;
 
 pub type Table = hashbrown::HashMap<usize, u128>;
 pub type Result = anyhow::Result<Table>;
@@ -46,8 +49,37 @@ pub fn run_analysis(ty: FileType, path: PathBuf, aho: AhoCorasick) -> Result {
     }
 }
 
-fn dir_mode(_path: PathBuf, _aho: AhoCorasick) -> Result {
-    unimplemented!()
+const PAR_THRES: usize = 5;
+fn dir_mode(path: PathBuf, aho: AhoCorasick) -> Result {
+    let entries: Vec<_> = read_dir(&path)?.filter_map(StdResult::ok).collect();
+    if entries.is_empty() {
+        return Err(anyhow!(""));
+    }
+
+    let results = Mutex::new(Table::new());
+    let len = entries.len();
+
+    let merge = |e: &std::fs::DirEntry| -> anyhow::Result<()> {
+        let table = run_analysis(e.file_type()?.into(), e.path(), aho.clone())?;
+        let mut results = results.try_lock().unwrap();
+        for (id, count) in table {
+            let entry = results.entry(id).or_insert(0);
+            *entry += count;
+        }
+        anyhow::Ok(())
+    };
+
+    if len < PAR_THRES {
+        entries.iter().try_for_each(merge)?;
+    } else {
+        entries.par_iter().try_for_each(merge)?;
+    }
+
+    if let Ok(r) = results.into_inner() {
+        Ok(r)
+    } else {
+        Err(anyhow!(""))
+    }
 }
 
 fn file_mode(path: PathBuf, aho: AhoCorasick) -> Result {
